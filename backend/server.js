@@ -9,9 +9,14 @@ import {
 } from "./pipeline.js";
 
 const PORT = process.env.PORT || 5000;
-const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
-const TIMEOUT_MS = 25000;
+const TIMEOUT_MS = 15000; // per model attempt
 const ai = process.env.GEMINI_API_KEY ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }) : null;
+
+// Models are tried in this order. GEMINI_MODEL (from .env) goes first.
+const DEFAULT_MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-flash-lite-latest", "gemini-3.5-flash"];
+const MODELS = [...new Set([process.env.GEMINI_MODEL, ...DEFAULT_MODELS]
+  .filter(Boolean)
+  .map((m) => m.trim().replace(/^models\//, "")))].slice(0, 4);
 
 const responseSchema = {
   type: Type.OBJECT,
@@ -25,13 +30,16 @@ const responseSchema = {
   required: ["summary", "benefits", "warnings", "recommendation", "riskLevel"],
 };
 
-async function callGemini(prompt) {
+const redact = (e) =>
+  String(e?.message || "unknown").split(process.env.GEMINI_API_KEY || "\u0000").join("[redacted]").slice(0, 160);
+
+async function generateOnce(model, prompt) {
   let timer;
   const timeout = new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("timeout")), TIMEOUT_MS); });
   try {
     const res = await Promise.race([
       ai.models.generateContent({
-        model: MODEL,
+        model,
         contents: prompt,
         config: { systemInstruction: SYSTEM_INSTRUCTION, responseMimeType: "application/json", responseSchema, temperature: 0.3 },
       }),
@@ -41,6 +49,21 @@ async function callGemini(prompt) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+// Try each model in order; move on if one is overloaded, slow, or unavailable.
+async function callGemini(prompt) {
+  let lastErr;
+  for (const model of MODELS) {
+    try {
+      return await generateOnce(model, prompt);
+    } catch (e) {
+      lastErr = e;
+      console.warn(`Model "${model}" failed: ${redact(e)}`);
+      if (/"code":\s*(401|403)|API key/i.test(String(e?.message))) throw e; // key problem: other models won't help
+    }
+  }
+  throw lastErr;
 }
 
 const app = express();
@@ -71,9 +94,7 @@ app.post("/api/analyze", async (req, res) => {
     const result = parsed ? applySafety(parsed, flags) : flags.length ? emergencyFallback(flags) : safeFallback();
     return res.json({ ...result, disclaimer: DISCLAIMER });
   } catch (err) {
-    // Log only a truncated message, never the key or user input
-    const msg = String(err?.message || "unknown").split(process.env.GEMINI_API_KEY).join("[redacted]").slice(0, 200);
-    console.error("Gemini request failed:", msg);
+    console.error("All Gemini attempts failed:", redact(err));
     if (flags.length) return res.json({ ...emergencyFallback(flags), disclaimer: DISCLAIMER });
     const timedOut = err?.message === "timeout";
     return res.status(timedOut ? 504 : 502).json({
@@ -90,4 +111,5 @@ app.use((err, _req, res, _next) => {
 });
 
 if (!ai) console.warn("WARNING: GEMINI_API_KEY is not set. Copy .env.example to .env and add your key.");
+console.log("Models in order:", MODELS.join(" -> "));
 app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));

@@ -1,0 +1,10 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { min-height: 100%; }
+body { @apply bg-slate-950 text-slate-100 font-sans antialiased overflow-x-hidden; }
+body::before {
+  content: ""; position: fixed; inset: 0; z-index: -1; pointer-events: none;
+  background: radial-gradient(60rem 30rem at 50% -10%, rgba(16,185,129,.18), transparent 60%);
+}
